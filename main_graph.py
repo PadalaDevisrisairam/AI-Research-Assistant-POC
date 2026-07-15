@@ -15,7 +15,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from tools import web_search
 from rag import load_rag
-
+from langchain_core.messages import SystemMessage
 
 # ============================================================
 # 1. LOAD ENVIRONMENT VARIABLES
@@ -37,6 +37,7 @@ else:
 
 class AgentState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
+    plan: list[str]
 
 
 # ============================================================
@@ -89,6 +90,46 @@ tools = [
 
 llm_with_tools = llm.bind_tools(tools)
 
+#=============================================================
+# Define the Planner node 
+#=============================================================
+
+def planner(state: AgentState):
+
+    user_question = state["messages"][-1].content
+
+    planner_prompt = f"""
+You are a planning agent.
+
+Analyze the user's research question and create a clear step-by-step plan.
+
+Available tools:
+1. web_search - Search the web for current information.
+2. rag_search - Search internal documents.
+3. calculator - Perform mathematical calculations.
+
+User question:
+{user_question}
+
+Return only a numbered step-by-step plan.
+"""
+
+    response = llm.invoke(planner_prompt)
+
+    plan = [
+        line.strip()
+        for line in response.content.split("\n")
+        if line.strip()
+    ]
+
+    print("\n[Planner]:")
+    for step in plan:
+        print(step)
+
+    return {
+        "plan": plan
+    }
+
 
 # ============================================================
 # 6. DEFINE ASSISTANT NODE
@@ -96,14 +137,32 @@ llm_with_tools = llm.bind_tools(tools)
 
 def assistant(state: AgentState):
 
+    plan = state.get("plan", [])
+
+    plan_text = "\n".join(plan)
+
+    system_message = SystemMessage(
+        content=f"""
+You are an AI Research Assistant.
+
+Follow the planner's plan when answering the user's question.
+
+Plan:
+{plan_text}
+
+Use the available tools when necessary.
+Do not claim that you used a tool unless you actually called it.
+After collecting enough information, provide the final answer.
+"""
+    )
+
     response = llm_with_tools.invoke(
-        state["messages"]
+        [system_message] + state["messages"]
     )
 
     return {
         "messages": [response]
     }
-
 
 # ============================================================
 # 7. CREATE TOOL NODE
@@ -119,6 +178,11 @@ tool_node = ToolNode(tools)
 builder = StateGraph(AgentState)
 
 builder.add_node(
+    "planner",
+    planner
+)
+
+builder.add_node(
     "assistant",
     assistant
 )
@@ -129,6 +193,11 @@ builder.add_node(
 )
 
 builder.set_entry_point(
+    "planner"
+)
+
+builder.add_edge(
+    "planner",
     "assistant"
 )
 
@@ -187,7 +256,11 @@ def run_researcher():
             config=config
         ):
 
-            for value in event.values():
+            for node_name, value in event.items():
+
+                # Planner node doesn't return messages
+                if "messages" not in value:
+                    continue
 
                 last_msg = value["messages"][-1]
 
@@ -218,9 +291,17 @@ def run_researcher():
                 # Final LLM response
                 else:
 
-                    print("\n[Final Answer]:")
-                    print(last_msg.content)
+                   print("\n[Final Answer]:")
 
+                   content = last_msg.content
+
+                   if isinstance(content, str):
+                    print(content)
+
+                   elif isinstance(content, list):
+                    for block in content:
+                     if isinstance(block, dict) and block.get("type") == "text":
+                      print(block.get("text", ""))
 
 if __name__ == "__main__":
     run_researcher()
